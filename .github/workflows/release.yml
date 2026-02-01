@@ -23,7 +23,7 @@ jobs:
           registry-url: "https://registry.npmjs.org"
 
       - run: npm ci
-      - run: npm test -- --passWithNoTests
+      - run: npm test
       - run: npm run build
 
       # Only publish when triggered by a tag push
