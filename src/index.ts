@@ -1,9 +1,16 @@
 import { createHash, createCipheriv, createDecipheriv, randomBytes, type HashOptions, Hash } from 'node:crypto'
-import { createReadStream, createWriteStream, statSync } from 'node:fs'
+import { createReadStream, createWriteStream, statSync, promises as fsPromises } from 'node:fs'
 import { Readable, Transform, pipeline } from 'node:stream'
 import { promisify } from 'node:util'
 
-const pipelineAsync = promisify(pipeline)
+export type CryptoContextOptions = {
+  minKeyBytes?: number
+  highWaterMark?: number
+}
+
+type DecipherivWithAuthTag = ReturnType<typeof createDecipheriv> & {
+  setAuthTag: (tag: Buffer) => void
+}
 
 type HashAlgorithm =
   | 'sha256'
@@ -19,11 +26,14 @@ type HashAlgorithm =
 const NONCE_LENGTH = 12
 const TAG_LENGTH = 16
 const MIN_KEY_BYTES = 32
+const HIGH_WATER_MARK = 1024 * 1024 // 1MB buffer for better performance
 
-function deriveKey(key: string): Buffer {
+const pipelineAsync = promisify(pipeline)
+
+function deriveKey(key: string, minKeyBytes: number): Buffer {
   const keyBytes = Buffer.from(key, 'utf8')
-  if (keyBytes.length < MIN_KEY_BYTES) {
-    throw new Error(`Key must be at least ${MIN_KEY_BYTES} bytes (UTF-8). Provided key is ${keyBytes.length} bytes.`)
+  if (keyBytes.length < minKeyBytes) {
+    throw new Error(`Key must be at least ${minKeyBytes} bytes (UTF-8). Provided key is ${keyBytes.length} bytes.`)
   }
   const hash = createHash('sha256')
   hash.update(keyBytes)
@@ -31,13 +41,18 @@ function deriveKey(key: string): Buffer {
 }
 
 export class FileCrypto {
-  static withKey(key: string, options?: { minKeyBytes?: number }): FileCryptoContext {
-    const minBytes = options?.minKeyBytes ?? MIN_KEY_BYTES
+
+  static createContext(key: string, options?: CryptoContextOptions): CryptoContext {
+    const minKeyBytes = options?.minKeyBytes ?? MIN_KEY_BYTES
+    const highWaterMark = options?.highWaterMark ?? HIGH_WATER_MARK
     const keyBytes = Buffer.from(key, 'utf8')
-    if (keyBytes.length < minBytes) {
-      throw new Error(`Key must be at least ${minBytes} bytes (UTF-8). Provided key is ${keyBytes.length} bytes.`)
+    if (keyBytes.length < minKeyBytes) {
+      throw new Error(`Key must be at least ${minKeyBytes} bytes (UTF-8). Provided key is ${keyBytes.length} bytes.`)
     }
-    return new FileCryptoContext(key)
+    return new CryptoContext(key, {
+      minKeyBytes,
+      highWaterMark,
+    })
   }
 
   static async calculateChecksum(
@@ -87,11 +102,13 @@ export class Digester {
   }
 }
 
-export class FileCryptoContext {
+export class CryptoContext {
   private readonly derivedKey: Buffer
+  private readonly highWaterMark: number
 
-  constructor(readonly key: string) {
-    this.derivedKey = deriveKey(key)
+  constructor(key: string, options: Required<CryptoContextOptions>) {
+    this.derivedKey = deriveKey(key, options.minKeyBytes)
+    this.highWaterMark = options.highWaterMark
   }
 
   /**
@@ -117,11 +134,15 @@ export class FileCryptoContext {
   getDerivedKey(): Buffer {
     return this.derivedKey
   }
+
+  getHighWaterMark(): number {
+    return this.highWaterMark
+  }
 }
 
 export class FileEncrypt {
   constructor(
-    private readonly context: FileCryptoContext,
+    private readonly context: CryptoContext,
     private readonly sourcePath: string,
     private readonly targetPath: string
   ) { }
@@ -135,8 +156,13 @@ export class FileEncrypt {
     const key = this.context.getDerivedKey()
     const nonce = randomBytes(NONCE_LENGTH)
 
-    const readStream = createReadStream(this.sourcePath)
-    const writeStream = createWriteStream(this.targetPath)
+    const highWaterMark = this.context.getHighWaterMark()
+    const readStream = createReadStream(this.sourcePath, {
+      highWaterMark,
+    })
+    const writeStream = createWriteStream(this.targetPath, {
+      highWaterMark,
+    })
 
     try {
       await new Promise<void>((resolve, reject) => {
@@ -174,7 +200,7 @@ export class FileEncrypt {
 
 export class FileDecrypt {
   constructor(
-    private readonly context: FileCryptoContext,
+    private readonly context: CryptoContext,
     private readonly sourcePath: string,
     private readonly targetPath: string
   ) { }
@@ -211,12 +237,19 @@ export class FileDecrypt {
     const ciphertextEnd = fileSize - TAG_LENGTH
     const tagStart = fileSize - TAG_LENGTH
 
-    const nonce = await this.readFileRange(sourcePath, nonceStart, NONCE_LENGTH)
-    const tag = await this.readFileRange(sourcePath, tagStart, TAG_LENGTH)
-    const ciphertextStream = createReadStream(sourcePath, { start: ciphertextStart, end: ciphertextEnd - 1 })
-    const writeStream = createWriteStream(targetPath)
+    const nonce = await this.readFixedBytes(sourcePath, nonceStart, NONCE_LENGTH)
+    const tag = await this.readFixedBytes(sourcePath, tagStart, TAG_LENGTH)
+    const highWaterMark = this.context.getHighWaterMark()
+    const ciphertextStream = createReadStream(sourcePath, {
+      start: ciphertextStart,
+      end: ciphertextEnd - 1,
+      highWaterMark,
+    })
+    const writeStream = createWriteStream(targetPath, {
+      highWaterMark,
+    })
 
-    const decipher = createDecipheriv('aes-256-gcm', key, nonce) as ReturnType<typeof createDecipheriv> & { setAuthTag: (tag: Buffer) => void }
+    const decipher = createDecipheriv('aes-256-gcm', key, nonce) as DecipherivWithAuthTag
     decipher.setAuthTag(tag)
 
     try {
@@ -233,45 +266,33 @@ export class FileDecrypt {
   }
 
   /**
-   * Reads an exact byte range from a file.
+   * Reads a fixed number of bytes from a file at a specific position.
+   * Uses fs.promises.open + read for efficient fixed-size reads.
    * Used for reading nonce (12 bytes from start) and tag (16 bytes from end).
    */
-  private async readFileRange(filePath: string, start: number, length: number): Promise<Buffer> {
-    return new Promise<Buffer>((resolve, reject) => {
-      const stream = createReadStream(filePath, { start, end: start + length - 1 })
-      const chunks: Buffer[] = []
-      let totalLength = 0
+  private async readFixedBytes(filePath: string, position: number, length: number): Promise<Buffer> {
+    const fileHandle = await fsPromises.open(filePath, 'r')
+    try {
+      const buffer = Buffer.alloc(length)
+      let bytesRead = 0
+      let offset = 0
 
-      const cleanup = () => {
-        stream.removeAllListeners()
-        stream.destroy()
+      while (bytesRead < length) {
+        const result = await fileHandle.read(buffer, offset, length - bytesRead, position + bytesRead)
+        if (result.bytesRead === 0) {
+          throw new Error(`Unexpected end of file: needed ${length} bytes, got ${bytesRead}`)
+        }
+        bytesRead += result.bytesRead
+        offset += result.bytesRead
       }
 
-      stream.on('data', (chunk: Buffer) => {
-        chunks.push(chunk)
-        totalLength += chunk.length
-      })
+      if (bytesRead !== length) {
+        throw new Error(`Expected ${length} bytes, got ${bytesRead}`)
+      }
 
-      stream.on('end', () => {
-        cleanup()
-        if (totalLength !== length) {
-          reject(new Error(`Expected ${length} bytes, got ${totalLength}`))
-        } else {
-          resolve(Buffer.concat(chunks, totalLength))
-        }
-      })
-
-      stream.on('error', (error: Error) => {
-        cleanup()
-        reject(error)
-      })
-
-      stream.on('close', () => {
-        if (totalLength < length) {
-          cleanup()
-          reject(new Error(`Unexpected end of stream: needed ${length} bytes, got ${totalLength}`))
-        }
-      })
-    })
+      return buffer
+    } finally {
+      await fileHandle.close()
+    }
   }
 }

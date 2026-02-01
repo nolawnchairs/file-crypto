@@ -3,6 +3,7 @@
         "Appender",
         "chunker",
         "ciphertext",
+        "Decipheriv",
         "decryptor",
         "encryptor",
         "nolawnchairs",
