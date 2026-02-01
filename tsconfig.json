@@ -17,6 +17,6 @@
     "noFallthroughCasesInSwitch": false,
     "baseUrl": "./src"
   },
-  "include": ["src", "sandbox.ts"],
+  "include": ["src"],
   "exclude": ["node_modules", "dist", "test"]
 }

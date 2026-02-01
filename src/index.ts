@@ -30,25 +30,20 @@ const HIGH_WATER_MARK = 1024 * 1024 // 1MB buffer for better performance
 
 const pipelineAsync = promisify(pipeline)
 
-function deriveKey(key: string, minKeyBytes: number): Buffer {
-  const keyBytes = Buffer.from(key, 'utf8')
-  if (keyBytes.length < minKeyBytes) {
-    throw new Error(`Key must be at least ${minKeyBytes} bytes (UTF-8). Provided key is ${keyBytes.length} bytes.`)
+function deriveKey(key: Buffer, minKeyBytes: number): Buffer {
+  if (key.length < minKeyBytes) {
+    throw new Error(`Key must be at least ${minKeyBytes} bytes. Provided key is ${key.length} bytes.`)
   }
   const hash = createHash('sha256')
-  hash.update(keyBytes)
+  hash.update(key)
   return hash.digest()
 }
 
 export class FileCrypto {
 
-  static createContext(key: string, options?: CryptoContextOptions): CryptoContext {
+  static createContext(key: Buffer, options?: CryptoContextOptions): CryptoContext {
     const minKeyBytes = options?.minKeyBytes ?? MIN_KEY_BYTES
     const highWaterMark = options?.highWaterMark ?? HIGH_WATER_MARK
-    const keyBytes = Buffer.from(key, 'utf8')
-    if (keyBytes.length < minKeyBytes) {
-      throw new Error(`Key must be at least ${minKeyBytes} bytes (UTF-8). Provided key is ${keyBytes.length} bytes.`)
-    }
     return new CryptoContext(key, {
       minKeyBytes,
       highWaterMark,
@@ -106,7 +101,7 @@ export class CryptoContext {
   private readonly derivedKey: Buffer
   private readonly highWaterMark: number
 
-  constructor(key: string, options: Required<CryptoContextOptions>) {
+  constructor(key: Buffer, options: Required<CryptoContextOptions>) {
     this.derivedKey = deriveKey(key, options.minKeyBytes)
     this.highWaterMark = options.highWaterMark
   }
