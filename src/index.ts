@@ -41,7 +41,7 @@ function deriveKey(key: Buffer, minKeyBytes: number): Buffer {
 
 export class FileCrypto {
 
-  static createContext(key: Buffer, options?: CryptoContextOptions): CryptoContext {
+  static createContext(key: Buffer, options?: CryptoContextOptions): ICryptoContext {
     const minKeyBytes = options?.minKeyBytes ?? MIN_KEY_BYTES
     const highWaterMark = options?.highWaterMark ?? HIGH_WATER_MARK
     return new CryptoContext(key, {
@@ -50,12 +50,32 @@ export class FileCrypto {
     })
   }
 
+  static createChecksumContext(algorithm: HashAlgorithm, options?: HashOptions): IChecksumContext {
+    return new ChecksumContext(algorithm, options)
+  }
+
   static async calculateChecksum(
     source: Readable | string,
     algorithm: HashAlgorithm,
     options?: HashOptions
   ): Promise<Digester> {
-    const hash = createHash(algorithm, options)
+    const context = new ChecksumContext(algorithm, options)
+    return context.calculate(source)
+  }
+}
+
+export interface IChecksumContext {
+  calculate(source: Readable | string): Promise<Digester>
+}
+
+export class ChecksumContext implements IChecksumContext {
+  constructor(
+    readonly algorithm: HashAlgorithm,
+    readonly options?: HashOptions
+  ) { }
+
+  async calculate(source: Readable | string): Promise<Digester> {
+    const hash = createHash(this.algorithm, this.options)
     const stream = typeof source === 'string'
       ? createReadStream(source)
       : source
@@ -97,7 +117,12 @@ export class Digester {
   }
 }
 
-export class CryptoContext {
+export interface ICryptoContext {
+  newEncryptor(sourcePath: string, targetPath: string): FileEncrypt
+  newDecryptor(sourcePath: string, targetPath: string): FileDecrypt
+}
+
+export class CryptoContext implements ICryptoContext {
   private readonly derivedKey: Buffer
   private readonly highWaterMark: number
 
@@ -168,13 +193,22 @@ export class FileEncrypt {
       })
 
       const cipher = createCipheriv('aes-256-gcm', key, nonce)
+      let authTag: Buffer | null = null
+
+      cipher.once('end', () => {
+        authTag = cipher.getAuthTag()
+      })
+
       const tagAppender = new Transform({
         transform(chunk: Buffer, encoding, callback) {
           callback(null, chunk)
         },
         flush(callback) {
-          const tag = cipher.getAuthTag()
-          this.push(tag)
+          if (!authTag) {
+            callback(new Error('Auth tag not available - cipher may not have finalized'))
+            return
+          }
+          this.push(authTag)
           callback()
         },
       })
