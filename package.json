@@ -7,6 +7,10 @@
   "keywords": [],
   "author": "Michael Wieczorek",
   "license": "ISC",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nolawnchairs/file-crypto"
+  },
   "devDependencies": {
     "@eslint/js": "^9.39.2",
     "@stylistic/eslint-plugin": "^5.7.1",
